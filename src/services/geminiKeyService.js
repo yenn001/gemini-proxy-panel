@@ -30,22 +30,50 @@ async function addGeminiKey(apiKey, name) {
     `;
 
     try {
+        // Insert the key first
         await configService.runDb(insertSQL, [keyId, trimmedApiKey, keyName]);
 
-        // Add the key ID to the rotation list in settings
-        const currentList = await configService.getSetting('gemini_key_list', []);
-        if (!Array.isArray(currentList)) {
-             console.warn("Setting 'gemini_key_list' is not an array, resetting.");
-             currentList = [];
-        }
-        currentList.push(keyId);
-        await configService.setSetting('gemini_key_list', currentList);
-        console.log(`Added key ${keyId} to database and rotation list.`);
+        // Use transaction for updating the key list
+        await configService.runDb('BEGIN TRANSACTION');
         
-        // Sync updates to GitHub
-        await syncToGitHub();
-
-        return { id: keyId, name: keyName };
+        try {
+            // Get the current list directly with SQL to avoid nested transactions
+            const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
+            let currentList = [];
+            
+            try {
+                currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
+                if (!Array.isArray(currentList)) {
+                    console.warn("Setting 'gemini_key_list' is not an array, resetting.");
+                    currentList = [];
+                }
+            } catch (e) {
+                console.warn("Error parsing gemini_key_list, resetting:", e);
+                currentList = [];
+            }
+            
+            // Add the new key ID to the list
+            currentList.push(keyId);
+            
+            // Update the list directly with SQL
+            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', 
+                ['gemini_key_list', JSON.stringify(currentList)]);
+            
+            // Commit the transaction
+            await configService.runDb('COMMIT');
+            
+            console.log(`Added key ${keyId} to database and rotation list.`);
+            
+            // Sync updates to GitHub outside transaction
+            await syncToGitHub();
+            
+            return { id: keyId, name: keyName };
+        } catch (error) {
+            // Rollback transaction on error
+            await configService.runDb('ROLLBACK');
+            console.error(`Transaction error while updating gemini_key_list:`, error);
+            throw error;
+        }
     } catch (err) {
         if (err.message.includes('UNIQUE constraint failed: gemini_keys.api_key')) {
             throw new Error('Cannot add duplicate API key.');
@@ -61,51 +89,83 @@ async function addGeminiKey(apiKey, name) {
  * @returns {Promise<void>}
  */
 async function deleteGeminiKey(keyId) {
-     if (!keyId || typeof keyId !== 'string' || keyId.trim() === '') {
+    if (!keyId || typeof keyId !== 'string' || keyId.trim() === '') {
         throw new Error('Invalid key ID provided for deletion.');
     }
     const trimmedKeyId = keyId.trim();
 
-    // Check if key exists before deleting
-    const keyExists = await configService.getDb('SELECT id FROM gemini_keys WHERE id = ?', [trimmedKeyId]);
-    if (!keyExists) {
-        throw new Error(`Key with ID '${trimmedKeyId}' not found.`);
-    }
-
-    // Delete key info from DB
-    await configService.runDb('DELETE FROM gemini_keys WHERE id = ?', [trimmedKeyId]);
-
-    // Remove key ID from the rotation list
-    const currentList = await configService.getSetting('gemini_key_list', []);
-     if (!Array.isArray(currentList)) {
-         console.warn("Setting 'gemini_key_list' is not an array during delete, resetting index.");
-         await configService.setSetting('gemini_key_index', 0); // Reset index if list was corrupt
-         return; // Can't remove from a non-array list
-     }
-
-    const initialLength = currentList.length;
-    const newList = currentList.filter(id => id !== trimmedKeyId);
-
-    if (newList.length < initialLength) {
-        await configService.setSetting('gemini_key_list', newList);
-        console.log(`Removed key ${trimmedKeyId} from rotation list.`);
-
-        // Adjust index if necessary
-        let currentIndex = await configService.getSetting('gemini_key_index', 0);
-        if (typeof currentIndex !== 'number') currentIndex = 0; // Handle non-numeric index
-
-        if (newList.length === 0) {
-            await configService.setSetting('gemini_key_index', 0); // Reset index if list is empty
-        } else if (currentIndex >= newList.length) {
-            await configService.setSetting('gemini_key_index', 0); // Reset index if it's out of bounds
+    // Use transaction to wrap the entire deletion process to ensure atomicity
+    await configService.runDb('BEGIN TRANSACTION');
+    
+    try {
+        // Check if key exists before deleting
+        const keyExists = await configService.getDb('SELECT id FROM gemini_keys WHERE id = ?', [trimmedKeyId]);
+        if (!keyExists) {
+            await configService.runDb('ROLLBACK');
+            throw new Error(`Key with ID '${trimmedKeyId}' not found.`);
         }
-    } else {
-        console.warn(`Key ID ${trimmedKeyId} was not found in the rotation list.`);
+
+        // Delete key info from DB
+        await configService.runDb('DELETE FROM gemini_keys WHERE id = ?', [trimmedKeyId]);
+
+        // Remove key ID from the rotation list - get the latest list state
+        const currentListValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_list']);
+        let currentList = [];
+        try {
+            currentList = currentListValue ? JSON.parse(currentListValue.value) : [];
+            if (!Array.isArray(currentList)) {
+                console.warn("Setting 'gemini_key_list' is not an array during delete, resetting index.");
+                // Update the index directly within transaction
+                await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['gemini_key_index', '0']);
+                await configService.runDb('COMMIT');
+                return; // Can't remove from a non-array list
+            }
+        } catch (e) {
+            console.warn("Error parsing gemini_key_list, resetting index:", e);
+            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['gemini_key_index', '0']);
+            await configService.runDb('COMMIT');
+            return;
+        }
+
+        const initialLength = currentList.length;
+        const newList = currentList.filter(id => id !== trimmedKeyId);
+
+        if (newList.length < initialLength) {
+            // Update the list directly with SQL
+            await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', 
+                ['gemini_key_list', JSON.stringify(newList)]);
+            console.log(`Removed key ${trimmedKeyId} from rotation list.`);
+
+            // Get the latest index state and adjust if needed
+            const indexValue = await configService.getDb('SELECT value FROM settings WHERE key = ?', ['gemini_key_index']);
+            let currentIndex = 0;
+            try {
+                currentIndex = indexValue ? parseInt(indexValue.value) : 0;
+                if (isNaN(currentIndex)) currentIndex = 0;
+            } catch (e) {
+                currentIndex = 0;
+            }
+
+            if (newList.length === 0 || currentIndex >= newList.length) {
+                // Reset index if list is empty or index is out of bounds
+                await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['gemini_key_index', '0']);
+            }
+        } else {
+            console.warn(`Key ID ${trimmedKeyId} was not found in the rotation list.`);
+        }
+        
+        // All operations completed successfully, commit the transaction
+        await configService.runDb('COMMIT');
+        console.log(`Deleted Gemini key ${trimmedKeyId} from database.`);
+        
+        // GitHub sync outside the transaction (doesn't affect atomicity)
+        await syncToGitHub();
+    } catch (error) {
+        // If any error occurs during the process, rollback the transaction
+        await configService.runDb('ROLLBACK');
+        console.error(`Error deleting Gemini key ${trimmedKeyId}:`, error);
+        throw error; // Re-throw the error for upstream handling
     }
-     console.log(`Deleted Gemini key ${trimmedKeyId} from database.`);
-     
-     // Sync updates to GitHub
-     await syncToGitHub();
 }
 
 /**
@@ -214,14 +274,25 @@ async function getErrorKeys() {
  * @returns {Promise<void>}
  */
 async function clearKeyError(keyId) {
+    await configService.runDb('BEGIN TRANSACTION');
+    
+    try {
         const result = await configService.runDb('UPDATE gemini_keys SET error_status = NULL WHERE id = ?', [keyId]);
         if (result.changes === 0) {
+            await configService.runDb('ROLLBACK');
             throw new Error(`Key with ID '${keyId}' not found for clearing error status.`);
         }
+        
+        await configService.runDb('COMMIT');
         console.log(`Cleared error status for key ${keyId}.`);
         
-        // Sync updates to GitHub
+        // Sync updates to GitHub - outside transaction
         await syncToGitHub();
+    } catch (error) {
+        await configService.runDb('ROLLBACK');
+        console.error(`Error clearing error status for key ${keyId}:`, error);
+        throw error;
+    }
 }
 
 /**
@@ -235,19 +306,31 @@ async function recordKeyError(keyId, status) {
         console.warn(`Attempted to record invalid error status ${status} for key ${keyId}.`);
         return;
     }
+    
+    // Use transaction to ensure atomicity
+    await configService.runDb('BEGIN TRANSACTION');
+    
     try {
         const result = await configService.runDb(
             'UPDATE gemini_keys SET error_status = ? WHERE id = ?',
             [status, keyId]
         );
-         if (result.changes > 0) {
+        
+        if (result.changes > 0) {
+            // Commit the transaction
+            await configService.runDb('COMMIT');
             console.log(`Recorded error status ${status} for key ${keyId}.`);
-            // Sync updates to GitHub
+            
+            // Sync updates to GitHub (outside transaction)
             await syncToGitHub();
-         } else {
-             console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
-         }
+        } else {
+            // Commit anyway since no update was made (key not found)
+            await configService.runDb('COMMIT');
+            console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
+        }
     } catch (e) {
+        // Rollback on error
+        await configService.runDb('ROLLBACK');
         console.error(`Failed to record error status ${status} for key ${keyId}:`, e);
         // Don't rethrow, recording error is secondary
     }
@@ -272,137 +355,170 @@ async function getNextAvailableGeminiKey(requestedModelId, updateIndex = true) {
             configService.getCategoryQuotas()
         ]);
 
-         if (!Array.isArray(allKeyIds) || allKeyIds.length === 0) {
+        if (!Array.isArray(allKeyIds) || allKeyIds.length === 0) {
             console.error("No Gemini keys configured in settings 'gemini_key_list'");
             return null;
         }
 
-        let currentIndex = (typeof currentIndexSetting === 'number' && currentIndexSetting >= 0) ? currentIndexSetting : 0;
-        if (currentIndex >= allKeyIds.length) {
-            currentIndex = 0; // Reset if index is out of bounds
-        }
-
-        // 2. Determine model category for quota checks
-        let modelCategory = undefined;
-        let modelConfig = undefined;
-        if (requestedModelId) {
-            modelConfig = modelsConfig[requestedModelId];
-            if (modelConfig) {
-                 modelCategory = modelConfig.category;
-            } else {
-                console.warn(`Model ID '${requestedModelId}' not found in config during key selection.`);
-                // Proceed without model-specific quota checks if model unknown
-            }
-        }
-
-        // 3. Iterate through keys using round-robin
-        const todayInLA = getTodayInLA();
+        // Use transaction for index updates to prevent race conditions
         let selectedKeyData = null;
-        let keysChecked = 0;
-        let initialIndex = currentIndex; // To detect full loop
-
-        while (keysChecked < allKeyIds.length) {
-            const keyId = allKeyIds[currentIndex];
-            keysChecked++;
-
-            const keyInfo = await configService.getDb('SELECT * FROM gemini_keys WHERE id = ?', [keyId]);
-
-            // --- Move index update here to ensure it always happens ---
-            const nextIndex = (currentIndex + 1) % allKeyIds.length;
-
-
-            // --- Validation Checks ---
-            if (!keyInfo) {
-                console.warn(`Key ID ${keyId} from list not found in database. Skipping.`);
-                 currentIndex = nextIndex;
-                continue; // Skip this key if its details aren't in the DB
-            }
-
-            // Check for 401/403 error status
-            if (keyInfo.error_status === 401 || keyInfo.error_status === 403) {
-                console.log(`Skipping key ${keyId} due to error status: ${keyInfo.error_status}`);
-                 currentIndex = nextIndex;
-                continue;
-            }
-
-            // Check quota if model category is known and it's the same day
-            let quotaExceeded = false;
-            if (modelCategory && keyInfo.usage_date === todayInLA) {
-                 try {
-                    const modelUsage = JSON.parse(keyInfo.model_usage || '{}');
-                    const categoryUsage = JSON.parse(keyInfo.category_usage || '{}');
-
-                    switch (modelCategory) {
-                        case 'Pro':
-                            if (modelConfig?.individualQuota) { // Check individual first
-                                if ((modelUsage[requestedModelId] || 0) >= modelConfig.individualQuota) {
-                                    console.log(`Skipping key ${keyId}: Pro model '${requestedModelId}' individual quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.individualQuota}).`);
-                                    quotaExceeded = true;
-                                }
-                            }
-                            if (!quotaExceeded && categoryQuotas.proQuota !== null && (categoryUsage.pro || 0) >= categoryQuotas.proQuota) {
-                                console.log(`Skipping key ${keyId}: Pro category quota reached (${categoryUsage.pro || 0}/${categoryQuotas.proQuota}).`);
-                                quotaExceeded = true;
-                            }
-                            break;
-                        case 'Flash':
-                             if (modelConfig?.individualQuota) { // Check individual first
-                                if ((modelUsage[requestedModelId] || 0) >= modelConfig.individualQuota) {
-                                    console.log(`Skipping key ${keyId}: Flash model '${requestedModelId}' individual quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.individualQuota}).`);
-                                    quotaExceeded = true;
-                                }
-                            }
-                            if (!quotaExceeded && categoryQuotas.flashQuota !== null && (categoryUsage.flash || 0) >= categoryQuotas.flashQuota) {
-                                console.log(`Skipping key ${keyId}: Flash category quota reached (${categoryUsage.flash || 0}/${categoryQuotas.flashQuota}).`);
-                                quotaExceeded = true;
-                            }
-                            break;
-                        case 'Custom':
-                            if (modelConfig?.dailyQuota !== null && (modelUsage[requestedModelId] || 0) >= modelConfig.dailyQuota) {
-                                console.log(`Skipping key ${keyId}: Custom model '${requestedModelId}' quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.dailyQuota}).`);
-                                quotaExceeded = true;
-                            }
-                            break;
-                    }
-                 } catch (parseError) {
-                     console.error(`Error parsing usage JSON for key ${keyId}. Skipping quota check. Error:`, parseError);
-                     // Optionally skip the key entirely if parsing fails
-                 }
-            }
-
-            if (quotaExceeded) {
-                 currentIndex = nextIndex;
-                continue; // Skip this key
-            }
-
-            // If we reach here, the key is valid
-            selectedKeyData = { id: keyInfo.id, key: keyInfo.api_key };
-             currentIndex = nextIndex; // Set index for the *next* request
-            break; // Found a valid key
-        } // End while loop
-
-        // --- Post-selection Updates ---
-        if (!selectedKeyData) {
-            console.error("No available Gemini keys found after checking all keys.");
-            return null;
-        }
-
-        // Only update indices if updateIndex is true (for API operations)
-        // Skip for read-only operations like fetching model lists
+        
+        // Start transaction if we're going to update the index
         if (updateIndex) {
-            // Save the next index for the subsequent request
-            // Use Promise.allSettled to avoid unhandled rejections if settings update fails
-            await Promise.allSettled([
-                configService.setSetting('gemini_key_index', currentIndex, true),
-                configService.setSetting('last_used_gemini_key_id', selectedKeyData.id, true)
-            ]);
-            await syncToGitHub();
-            console.log(`Selected Gemini Key ID via sequential round-robin: ${selectedKeyData.id} (next index will be: ${currentIndex})`);
-        } else {
-            console.log(`Selected Gemini Key ID (read-only): ${selectedKeyData.id} (index not updated)`);
+            await configService.runDb('BEGIN TRANSACTION');
         }
-        return selectedKeyData;
+        
+        try {
+            // Get the most current index value within the transaction if updating
+            let currentIndex;
+            if (updateIndex) {
+                const refreshedIndexSetting = await configService.getSetting('gemini_key_index', 0);
+                currentIndex = (typeof refreshedIndexSetting === 'number' && refreshedIndexSetting >= 0) ? 
+                    refreshedIndexSetting : 0;
+            } else {
+                currentIndex = (typeof currentIndexSetting === 'number' && currentIndexSetting >= 0) ? 
+                    currentIndexSetting : 0;
+            }
+            
+            if (currentIndex >= allKeyIds.length) {
+                currentIndex = 0; // Reset if index is out of bounds
+            }
 
+            // 2. Determine model category for quota checks
+            let modelCategory = undefined;
+            let modelConfig = undefined;
+            if (requestedModelId) {
+                modelConfig = modelsConfig[requestedModelId];
+                if (modelConfig) {
+                    modelCategory = modelConfig.category;
+                } else {
+                    console.warn(`Model ID '${requestedModelId}' not found in config during key selection.`);
+                    // Proceed without model-specific quota checks if model unknown
+                }
+            }
+
+            // 3. Iterate through keys using round-robin
+            const todayInLA = getTodayInLA();
+            let keysChecked = 0;
+            let initialIndex = currentIndex; // To detect full loop
+
+            while (keysChecked < allKeyIds.length) {
+                const keyId = allKeyIds[currentIndex];
+                keysChecked++;
+
+                const keyInfo = await configService.getDb('SELECT * FROM gemini_keys WHERE id = ?', [keyId]);
+
+                // --- Move index update here to ensure it always happens ---
+                const nextIndex = (currentIndex + 1) % allKeyIds.length;
+
+                // --- Validation Checks ---
+                if (!keyInfo) {
+                    console.warn(`Key ID ${keyId} from list not found in database. Skipping.`);
+                    currentIndex = nextIndex;
+                    continue; // Skip this key if its details aren't in the DB
+                }
+
+                // Check for 401/403 error status
+                if (keyInfo.error_status === 401 || keyInfo.error_status === 403) {
+                    console.log(`Skipping key ${keyId} due to error status: ${keyInfo.error_status}`);
+                    currentIndex = nextIndex;
+                    continue;
+                }
+
+                // Check quota if model category is known and it's the same day
+                let quotaExceeded = false;
+                if (modelCategory && keyInfo.usage_date === todayInLA) {
+                    try {
+                        const modelUsage = JSON.parse(keyInfo.model_usage || '{}');
+                        const categoryUsage = JSON.parse(keyInfo.category_usage || '{}');
+
+                        switch (modelCategory) {
+                            case 'Pro':
+                                if (modelConfig?.individualQuota) { // Check individual first
+                                    if ((modelUsage[requestedModelId] || 0) >= modelConfig.individualQuota) {
+                                        console.log(`Skipping key ${keyId}: Pro model '${requestedModelId}' individual quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.individualQuota}).`);
+                                        quotaExceeded = true;
+                                    }
+                                }
+                                if (!quotaExceeded && categoryQuotas.proQuota !== null && (categoryUsage.pro || 0) >= categoryQuotas.proQuota) {
+                                    console.log(`Skipping key ${keyId}: Pro category quota reached (${categoryUsage.pro || 0}/${categoryQuotas.proQuota}).`);
+                                    quotaExceeded = true;
+                                }
+                                break;
+                            case 'Flash':
+                                if (modelConfig?.individualQuota) { // Check individual first
+                                    if ((modelUsage[requestedModelId] || 0) >= modelConfig.individualQuota) {
+                                        console.log(`Skipping key ${keyId}: Flash model '${requestedModelId}' individual quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.individualQuota}).`);
+                                        quotaExceeded = true;
+                                    }
+                                }
+                                if (!quotaExceeded && categoryQuotas.flashQuota !== null && (categoryUsage.flash || 0) >= categoryQuotas.flashQuota) {
+                                    console.log(`Skipping key ${keyId}: Flash category quota reached (${categoryUsage.flash || 0}/${categoryQuotas.flashQuota}).`);
+                                    quotaExceeded = true;
+                                }
+                                break;
+                            case 'Custom':
+                                if (modelConfig?.dailyQuota !== null && (modelUsage[requestedModelId] || 0) >= modelConfig.dailyQuota) {
+                                    console.log(`Skipping key ${keyId}: Custom model '${requestedModelId}' quota reached (${modelUsage[requestedModelId] || 0}/${modelConfig.dailyQuota}).`);
+                                    quotaExceeded = true;
+                                }
+                                break;
+                        }
+                    } catch (parseError) {
+                        console.error(`Error parsing usage JSON for key ${keyId}. Skipping quota check. Error:`, parseError);
+                        // Optionally skip the key entirely if parsing fails
+                    }
+                }
+
+                if (quotaExceeded) {
+                    currentIndex = nextIndex;
+                    continue; // Skip this key
+                }
+
+                // If we reach here, the key is valid
+                selectedKeyData = { id: keyInfo.id, key: keyInfo.api_key };
+                currentIndex = nextIndex; // Set index for the *next* request
+                break; // Found a valid key
+            } // End while loop
+
+            // --- Post-selection Updates ---
+            if (!selectedKeyData) {
+                if (updateIndex) {
+                    await configService.runDb('ROLLBACK'); // Rollback if no key found
+                }
+                console.error("No available Gemini keys found after checking all keys.");
+                return null;
+            }
+
+            // Only update indices if updateIndex is true (for API operations)
+            // Skip for read-only operations like fetching model lists
+            if (updateIndex) {
+                // Save the next index for the subsequent request within the transaction
+                // Use direct SQL to avoid nested transactions
+                await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', 
+                    ['gemini_key_index', String(currentIndex)]);
+                await configService.runDb('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', 
+                    ['last_used_gemini_key_id', selectedKeyData.id]);
+                
+                // Commit the transaction
+                await configService.runDb('COMMIT');
+                
+                // GitHub sync outside transaction
+                await syncToGitHub();
+                console.log(`Selected Gemini Key ID via sequential round-robin: ${selectedKeyData.id} (next index will be: ${currentIndex})`);
+            } else {
+                console.log(`Selected Gemini Key ID (read-only): ${selectedKeyData.id} (index not updated)`);
+            }
+            
+            return selectedKeyData;
+            
+        } catch (error) {
+            // If any error occurs and we're in a transaction, rollback
+            if (updateIndex) {
+                await configService.runDb('ROLLBACK');
+            }
+            throw error; // Re-throw to be caught by outer try/catch
+        }
     } catch (error) {
         console.error("Error retrieving or processing Gemini keys:", error);
         return null;
@@ -419,13 +535,18 @@ async function getNextAvailableGeminiKey(requestedModelId, updateIndex = true) {
  * @returns {Promise<void>}
  */
 async function incrementKeyUsage(keyId, modelId, category) {
-    const keyRow = await configService.getDb('SELECT usage_date, model_usage, category_usage, consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
-    if (!keyRow) {
-        console.warn(`Cannot increment usage: Key info not found for ID: ${keyId}`);
-        return;
-    }
-
+    // Start a transaction for atomic update
+    await configService.runDb('BEGIN TRANSACTION');
+    
     try {
+        // Get the most current key data within the transaction
+        const keyRow = await configService.getDb('SELECT usage_date, model_usage, category_usage, consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
+        if (!keyRow) {
+            await configService.runDb('ROLLBACK');
+            console.warn(`Cannot increment usage: Key info not found for ID: ${keyId}`);
+            return;
+        }
+
         const todayInLA = getTodayInLA();
         let modelUsage = JSON.parse(keyRow.model_usage || '{}');
         let categoryUsage = JSON.parse(keyRow.category_usage || '{}');
@@ -453,7 +574,7 @@ async function incrementKeyUsage(keyId, modelId, category) {
             categoryUsage.flash = (categoryUsage.flash || 0) + 1;
         }
 
-        // Update the database
+        // Update the database within the transaction
         const sql = `
             UPDATE gemini_keys
             SET usage_date = ?, model_usage = ?, category_usage = ?, consecutive_429_counts = ?
@@ -466,12 +587,17 @@ async function incrementKeyUsage(keyId, modelId, category) {
             JSON.stringify(consecutive429Counts), // Store empty object (reset counters)
             keyId
         ]);
+        
+        // Commit the transaction after successful update
+        await configService.runDb('COMMIT');
+        
         console.log(`Usage for key ${keyId} updated. Date: ${usageDate}, Model: ${modelId} (${category}), Models: ${JSON.stringify(modelUsage)}, Categories: ${JSON.stringify(categoryUsage)}, 429Counts reset.`);
         
-        // Sync updates to GitHub
+        // Sync updates to GitHub - outside transaction
         await syncToGitHub();
-
     } catch (e) {
+        // Rollback the transaction if any error occurs
+        await configService.runDb('ROLLBACK');
         console.error(`Failed to increment usage for key ${keyId}:`, e);
         // Don't rethrow, allow request to potentially succeed anyway
     }
@@ -487,15 +613,22 @@ async function incrementKeyUsage(keyId, modelId, category) {
  * @returns {Promise<void>}
  */
 async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
-     try {
+    // Start a transaction for atomic update
+    await configService.runDb('BEGIN TRANSACTION');
+    
+    try {
         // Fetch current key info and configs
-        const [keyRow, modelsConfig, categoryQuotas] = await Promise.all([
-            configService.getDb('SELECT usage_date, model_usage, category_usage, consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]),
-             configService.getModelsConfig(),
-             configService.getCategoryQuotas()
+        // Get models and quotas outside the transaction as they don't need to be transactional
+        const [modelsConfig, categoryQuotas] = await Promise.all([
+            configService.getModelsConfig(),
+            configService.getCategoryQuotas()
         ]);
+        
+        // Get the latest key data within transaction
+        const keyRow = await configService.getDb('SELECT usage_date, model_usage, category_usage, consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
 
         if (!keyRow) {
+            await configService.runDb('ROLLBACK');
             console.warn(`Cannot force quota limit: Key info not found for ID: ${keyId}`);
             return;
         }
@@ -515,11 +648,11 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
             consecutive429Counts = {}; // Also reset 429 counts on date change
         }
 
-         // Reset the specific 429 counter
-         if (counterKey && consecutive429Counts.hasOwnProperty(counterKey)) {
-             console.log(`Resetting 429 counter for key ${keyId}, counter ${counterKey} after forcing quota.`);
-             delete consecutive429Counts[counterKey];
-         }
+        // Reset the specific 429 counter
+        if (counterKey && consecutive429Counts.hasOwnProperty(counterKey)) {
+            console.log(`Resetting 429 counter for key ${keyId}, counter ${counterKey} after forcing quota.`);
+            delete consecutive429Counts[counterKey];
+        }
 
         // Determine the limit and update the relevant usage counter
         let quotaLimit = Infinity;
@@ -541,7 +674,7 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
                 }
                 break;
             case 'Flash':
-                 if (modelId && modelConfig?.individualQuota) {
+                if (modelId && modelConfig?.individualQuota) {
                     quotaLimit = modelConfig.individualQuota;
                     modelUsage[modelId] = quotaLimit;
                     console.log(`Forcing Flash model ${modelId} individual usage for key ${keyId} to limit: ${quotaLimit}`);
@@ -549,8 +682,8 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
                 } else if (categoryQuotas.flashQuota !== null) {
                     quotaLimit = categoryQuotas.flashQuota;
                     categoryUsage.flash = quotaLimit;
-                     console.log(`Forcing Flash category usage for key ${keyId} to limit: ${quotaLimit}`);
-                     updated = true;
+                    console.log(`Forcing Flash category usage for key ${keyId} to limit: ${quotaLimit}`);
+                    updated = true;
                 }
                 break;
             case 'Custom':
@@ -560,44 +693,50 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
                     console.log(`Forcing Custom model ${modelId} usage for key ${keyId} to limit: ${quotaLimit}`);
                     updated = true;
                 } else if (!modelId) {
-                     console.warn(`Cannot force quota limit for Custom category without modelId.`);
+                    console.warn(`Cannot force quota limit for Custom category without modelId.`);
                 }
                 break;
         }
 
         if (!updated) {
-             console.warn(`No relevant quota found to force for key ${keyId}, category ${category}, model ${modelId}.`);
-             // Still save potential reset of 429 counter if counterKey was provided
-             if (counterKey) {
-                  await configService.runDb(
+            console.warn(`No relevant quota found to force for key ${keyId}, category ${category}, model ${modelId}.`);
+            // Still save potential reset of 429 counter if counterKey was provided
+            if (counterKey) {
+                await configService.runDb(
                     'UPDATE gemini_keys SET consecutive_429_counts = ? WHERE id = ?',
                     [JSON.stringify(consecutive429Counts), keyId]
-                 );
-             }
-             return;
+                );
+            }
+            await configService.runDb('COMMIT'); // Still commit the transaction
+            return;
         }
 
-        // Update the database
+        // Update the database within transaction
         const sql = `
             UPDATE gemini_keys
             SET usage_date = ?, model_usage = ?, category_usage = ?, consecutive_429_counts = ?
             WHERE id = ?
         `;
-         await configService.runDb(sql, [
+        await configService.runDb(sql, [
             usageDate,
             JSON.stringify(modelUsage),
             JSON.stringify(categoryUsage),
             JSON.stringify(consecutive429Counts),
             keyId
-          ]);
-         console.log(`Key ${keyId} quota forced for category ${category}${modelId ? ` (model: ${modelId})` : ''} for date ${usageDate}.`);
-         
-         // Sync updates to GitHub
-         await syncToGitHub();
-
-      } catch (e) {
-         console.error(`Failed to force quota limit for key ${keyId}:`, e);
-     }
+        ]);
+        
+        // Commit the transaction
+        await configService.runDb('COMMIT');
+        
+        console.log(`Key ${keyId} quota forced for category ${category}${modelId ? ` (model: ${modelId})` : ''} for date ${usageDate}.`);
+        
+        // Sync updates to GitHub outside transaction
+        await syncToGitHub();
+    } catch (e) {
+        // Rollback on error
+        await configService.runDb('ROLLBACK');
+        console.error(`Failed to force quota limit for key ${keyId}:`, e);
+    }
 }
 
 /**
@@ -610,14 +749,21 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
 async function handle429Error(keyId, category, modelId) {
     const CONSECUTIVE_429_LIMIT = 3;
 
+    // Start a transaction for atomic update
+    await configService.runDb('BEGIN TRANSACTION');
+    
     try {
-         const [keyRow, modelsConfig, categoryQuotas] = await Promise.all([
-            configService.getDb('SELECT consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]),
+        // Get models and quotas outside transaction as they don't need to be transactional
+        const [modelsConfig, categoryQuotas] = await Promise.all([
             configService.getModelsConfig(),
             configService.getCategoryQuotas()
         ]);
+        
+        // Get key data within transaction
+        const keyRow = await configService.getDb('SELECT consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
 
         if (!keyRow) {
+            await configService.runDb('ROLLBACK');
             console.warn(`Cannot handle 429: Key info not found for ID: ${keyId}`);
             return;
         }
@@ -629,7 +775,7 @@ async function handle429Error(keyId, category, modelId) {
         let needsQuotaCheck = false;
         const modelConfig = modelId ? modelsConfig[modelId] : undefined;
 
-         if (category === 'Custom' && modelId) {
+        if (category === 'Custom' && modelId) {
             counterKey = modelId;
             needsQuotaCheck = !!modelConfig?.dailyQuota;
         } else if ((category === 'Pro' || category === 'Flash') && modelId && modelConfig?.individualQuota) {
@@ -644,10 +790,13 @@ async function handle429Error(keyId, category, modelId) {
         }
 
         if (!counterKey) {
+            await configService.runDb('ROLLBACK');
             console.warn(`Could not determine counter key for 429 handling (key ${keyId}, category ${category}, model ${modelId}).`);
             return;
         }
+        
         if (!needsQuotaCheck) {
+            await configService.runDb('ROLLBACK');
             console.log(`Skipping 429 counter for key ${keyId}, counter ${counterKey} as no relevant quota is configured.`);
             return;
         }
@@ -658,21 +807,28 @@ async function handle429Error(keyId, category, modelId) {
 
         console.warn(`Received 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
 
-        // Check limit and force quota if reached
+        // Check if we need to force quota limit
         if (currentCount >= CONSECUTIVE_429_LIMIT) {
+            // Commit this transaction before calling forceSetQuotaToLimit
+            // because forceSetQuotaToLimit starts its own transaction
+            await configService.runDb('COMMIT');
+            
             console.warn(`Consecutive 429 limit (${CONSECUTIVE_429_LIMIT}) reached for key ${keyId}, counter ${counterKey}. Forcing quota limit.`);
-            // forceSetQuotaToLimit will reset the counterKey within consecutive429Counts
+            // forceSetQuotaToLimit will handle the counterKey reset and has its own transaction
             await forceSetQuotaToLimit(keyId, category, modelId, counterKey);
-            // No need to save consecutive429Counts separately here, forceSet does it.
         } else {
-            // Limit not reached, just save the updated count
-             await configService.runDb(
+            // Limit not reached, update the count within this transaction
+            await configService.runDb(
                 'UPDATE gemini_keys SET consecutive_429_counts = ? WHERE id = ?',
-                 [JSON.stringify(consecutive429Counts), keyId]
-              );
-         }
-
+                [JSON.stringify(consecutive429Counts), keyId]
+            );
+            
+            // Commit the transaction
+            await configService.runDb('COMMIT');
+        }
     } catch (e) {
+        // Rollback on error
+        await configService.runDb('ROLLBACK');
         console.error(`Failed to handle 429 error for key ${keyId}:`, e);
     }
 }

@@ -972,25 +972,32 @@ function hideError(container = errorMessageDiv) {
             showError(`Invalid API key format detected: ${maskedInvalidKeys.join(', ')}`);
         }
         
-        // Create an array of promises for concurrent execution
-        const addPromises = validKeys.map(key => {
+        // 改为串行处理API密钥添加，避免并发请求导致的问题
+        showLoading();
+        let successCount = 0;
+        
+        // 逐个处理每个API Key
+        for (const key of validKeys) {
             const keyData = {
                 key: key,
                 name: data.name ? data.name.trim() : ''
             };
             
-            return apiFetch('/gemini-keys', {
-                method: 'POST',
-                body: JSON.stringify(keyData),
-            });
-        });
+            try {
+                const result = await apiFetch('/gemini-keys', {
+                    method: 'POST',
+                    body: JSON.stringify(keyData),
+                });
+                
+                if (result && result.success) {
+                    successCount++;
+                }
+            } catch (error) {
+                console.error(`Error adding key ${key}:`, error);
+                // 继续处理下一个密钥
+            }
+        }
         
-        // Execute all requests concurrently
-        showLoading();
-        const results = await Promise.all(addPromises);
-        
-        // Count successes and failures
-        const successCount = results.filter(result => result && result.success).length;
         const failureCount = validKeys.length - successCount;
         
         // Reset form and reload keys
@@ -1080,11 +1087,25 @@ function hideError(container = errorMessageDiv) {
         // --- End Clear Gemini Key Error ---
     });
 
-     // Add Worker Key (no changes needed)
+     // Add Worker Key with validation
     addWorkerKeyForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const formData = new FormData(addWorkerKeyForm);
         const data = Object.fromEntries(formData.entries());
+        
+        // Validate worker key format - allow alphanumeric, hyphens, and underscores
+        const workerKeyValue = data.key?.trim();
+        if (!workerKeyValue) {
+            showError('Worker key is required.');
+            return;
+        }
+        
+        const validKeyRegex = /^[a-zA-Z0-9_\-]+$/;
+        if (!validKeyRegex.test(workerKeyValue)) {
+            showError('Worker key can only contain letters, numbers, underscores (_), and hyphens (-).');
+            return;
+        }
+        
         const result = await apiFetch('/worker-keys', {
             method: 'POST',
             body: JSON.stringify(data),
@@ -1134,9 +1155,16 @@ function hideError(container = errorMessageDiv) {
         }
     }
 
-    // Generate Random Worker Key (no changes needed)
+    // Generate Random Worker Key with valid format
     generateWorkerKeyBtn.addEventListener('click', () => {
-        const randomKey = 'wk-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        const validChars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        let randomKey = 'sk-';
+        
+        for (let i = 0; i < 20; i++) {
+            const randomIndex = Math.floor(Math.random() * validChars.length);
+            randomKey += validChars[randomIndex];
+        }
+        
         workerKeyValueInput.value = randomKey;
     });
 
