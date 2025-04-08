@@ -60,6 +60,62 @@ router.delete('/gemini-keys/:id', async (req, res, next) => {
     }
 });
 
+// Base Gemini API URL
+const BASE_GEMINI_URL = 'https://generativelanguage.googleapis.com';
+// Cloudflare Gateway base path
+const CF_GATEWAY_BASE = 'https://gateway.ai.cloudflare.com/v1';
+// Project ID regex pattern - 32 character hex string
+const PROJECT_ID_REGEX = /^[0-9a-f]{32}$/i;
+// Default Cloudflare Gateway project ID
+const DEFAULT_PROJECT_ID = 'db16589aa22233d56fe69a2c3161fe3c';
+
+// Helper to get the base URL for Gemini API
+function getGeminiBaseUrl() {
+    let baseUrl = BASE_GEMINI_URL;
+    let cfGateway = process.env.CF_GATEWAY;
+    
+    // Return default URL if CF_GATEWAY is not set
+    if (!cfGateway) {
+        return baseUrl;
+    }
+    
+    // Handle case 1: CF_GATEWAY = "1" (use default project ID)
+    if (cfGateway === '1') {
+        // Validate default project ID format
+        if (PROJECT_ID_REGEX.test(DEFAULT_PROJECT_ID)) {
+            // Only use default Cloudflare Gateway if project ID format is valid
+            return `${CF_GATEWAY_BASE}/${DEFAULT_PROJECT_ID}/gemini/google-ai-studio`;
+        }
+        // If invalid, fall back to default Gemini API URL
+        return baseUrl;
+    }
+    
+    // Extract projectId/gatewayName from any string that contains it
+    try {
+        // Remove trailing slashes
+        cfGateway = cfGateway.replace(/\/+$/, '');
+        
+        // Try to extract projectId/gatewayName pattern from anywhere in the string
+        // This will work for both full URLs and direct format strings
+        const pattern = /([0-9a-f]{32})\/([^\/\s]+)/i;
+        const matches = cfGateway.match(pattern);
+        
+        if (matches && matches.length >= 3) {
+            const projectId = matches[1];
+            const gatewayName = matches[2];
+            
+            if (PROJECT_ID_REGEX.test(projectId)) {
+                return `${CF_GATEWAY_BASE}/${projectId}/${gatewayName}/google-ai-studio`;
+            }
+        }
+    } catch (error) {
+        console.error('Error parsing CF_GATEWAY value:', error);
+    }
+    
+    // For any other value of CF_GATEWAY, fall back to default Gemini API URL
+    return baseUrl;
+}
+
 // --- Test Gemini Key --- (/api/admin/test-gemini-key)
 router.post('/test-gemini-key', async (req, res, next) => {
      try {
@@ -80,7 +136,8 @@ router.post('/test-gemini-key', async (req, res, next) => {
         const modelCategory = modelsConfig[modelId]?.category;
 
         const testGeminiRequestBody = { contents: [{ role: "user", parts: [{ text: "Hi" }] }] };
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+        const baseUrl = getGeminiBaseUrl();
+        const geminiUrl = `${baseUrl}/v1beta/models/${modelId}:generateContent`;
 
         let testResponseStatus = 500;
         let testResponseBody = null;
@@ -89,7 +146,10 @@ router.post('/test-gemini-key', async (req, res, next) => {
         try {
             const response = await fetch(geminiUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': apiKey
+                },
                 body: JSON.stringify(testGeminiRequestBody)
             });
             testResponseStatus = response.status;
@@ -137,8 +197,15 @@ router.get('/gemini-models', async (req, res, next) => {
              return res.json([]); // Return empty list if no keys work
          }
 
-         const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${availableKey.key}`;
-         const response = await fetch(geminiUrl, { method: 'GET', headers: { 'Content-Type': 'application/json' } });
+         const baseUrl = getGeminiBaseUrl();
+         const geminiUrl = `${baseUrl}/v1beta/models`;
+         const response = await fetch(geminiUrl, { 
+             method: 'GET', 
+             headers: { 
+                 'Content-Type': 'application/json',
+                 'x-goog-api-key': availableKey.key
+             } 
+         });
 
          if (!response.ok) {
              const errorBody = await response.text();
