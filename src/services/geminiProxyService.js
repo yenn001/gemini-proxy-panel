@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+const { Readable } = require('stream');
 const { syncToGitHub } = require('../db'); 
 const configService = require('./configService');
 const geminiKeyService = require('./geminiKeyService');
@@ -6,14 +7,11 @@ const transformUtils = require('../utils/transform');
 
 // Base Gemini API URL
 const BASE_GEMINI_URL = 'https://generativelanguage.googleapis.com';
-// Cloudflare Gateway base path
-const CF_GATEWAY_BASE = 'https://gateway.ai.cloudflare.com/v1';
-// Project ID regex pattern - 32 character hex string
-const PROJECT_ID_REGEX = /^[0-9a-f]{32}$/i;
-// Default Cloudflare Gateway project ID
-const DEFAULT_PROJECT_ID = 'db16589aa22233d56fe69a2c3161fe3c';
 
 async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
+    // Check if KEEPALIVE mode is enabled
+    const keepAliveEnabled = process.env.KEEPALIVE === '1';
+    
     const requestedModelId = openAIRequestBody?.model;
 
     if (!requestedModelId) {
@@ -37,6 +35,12 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
             configService.getModelsConfig(),
             configService.getWorkerKeySafetySetting(workerApiKey) // Get safety setting for this worker key
         ]);
+        
+        // If KEEPALIVE is enabled, this is a streaming request, and safety is disabled, we'll handle it specially
+        const useKeepAlive = !isSafetyEnabled && keepAliveEnabled && stream;
+    
+        // If using keepalive, we'll make a non-streaming request to Gemini but send streaming responses to client
+        const actualStreamMode = useKeepAlive ? false : stream;
 
         modelInfo = modelsConfig[requestedModelId];
         if (!modelInfo) {
@@ -101,61 +105,32 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
                 }
 
                 // 4. Prepare and Send Request to Gemini
-                const apiAction = stream ? 'streamGenerateContent' : 'generateContent';
+                // If keepalive is enabled and original request was streaming, use non-streaming API
+                const apiAction = actualStreamMode ? 'streamGenerateContent' : 'generateContent';
                 
-                // Build base URL based on CF_GATEWAY environment variable
-                let baseUrl = BASE_GEMINI_URL;
-                let cfGateway = process.env.CF_GATEWAY;
-                
-                // Return default URL if CF_GATEWAY is not set
-                if (!cfGateway) {
-                    // Use default Gemini API URL
-                } else {
-                    // Handle case 1: CF_GATEWAY = "1" (use default project ID)
-                    if (cfGateway === '1') {
-                        // Validate default project ID format
-                        if (PROJECT_ID_REGEX.test(DEFAULT_PROJECT_ID)) {
-                            // Only use default Cloudflare Gateway if project ID format is valid
-                            baseUrl = `${CF_GATEWAY_BASE}/${DEFAULT_PROJECT_ID}/gemini/google-ai-studio`;
-                        }
-                        // If invalid, fall back to default Gemini API URL
-                    } else {
-                        // Extract projectId/gatewayName from any string that contains it
-                        try {
-                            // Remove trailing slashes
-                            cfGateway = cfGateway.replace(/\/+$/, '');
-                            
-                            // Try to extract projectId/gatewayName pattern from anywhere in the string
-                            // This will work for both full URLs and direct format strings
-                            const pattern = /([0-9a-f]{32})\/([^\/\s]+)/i;
-                            const matches = cfGateway.match(pattern);
-                            
-                            if (matches && matches.length >= 3) {
-                                const projectId = matches[1];
-                                const gatewayName = matches[2];
-                                
-                                if (PROJECT_ID_REGEX.test(projectId)) {
-                                    baseUrl = `${CF_GATEWAY_BASE}/${projectId}/${gatewayName}/google-ai-studio`;
-                                }
-                            }
-                        } catch (error) {
-                            console.error('Error parsing CF_GATEWAY value:', error);
-                            // Fall back to default URL on error
-                        }
-                    }
-                    // For any other value of CF_GATEWAY, keep using default Gemini API URL
-                }
-                
-                // Build complete API URL
-                const geminiUrl = `${baseUrl}/v1beta/models/${requestedModelId}:${apiAction}`;
+                // Build complete API URL with the default Gemini API URL
+                const geminiUrl = `${BASE_GEMINI_URL}/v1beta/models/${requestedModelId}:${apiAction}`;
                 
                 const geminiRequestHeaders = {
                     'Content-Type': 'application/json',
-                    'User-Agent': `gemini-proxy-panel-node/1.0`,
+                    'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36`,
+                    'X-Accel-Buffering': 'no',
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'Pragma': 'no-cache',
+                    'Expires': '0',
                     'x-goog-api-key': selectedKey.key
                 };
 
-                console.log(`Attempt ${attempt}: Sending ${stream ? 'streaming' : 'non-streaming'} request to Gemini URL: ${geminiUrl}`);
+                console.log(`Attempt ${attempt}: Sending ${actualStreamMode ? 'streaming' : 'non-streaming'} request to Gemini URL: ${geminiUrl}`);
+                
+                // Log if using keepalive mode
+                if (keepAliveEnabled && stream) {
+                    if (useKeepAlive) {
+                        console.log(`Using KEEPALIVE mode: Client expects stream but sending non-streaming request to Gemini (Safety disabled)`);
+                    } else {
+                        console.log(`KEEPALIVE is enabled but safety is also enabled. Using normal streaming mode.`);
+                    }
+                }
 
                 const geminiResponse = await fetch(geminiUrl, {
                     method: 'POST',
@@ -215,12 +190,27 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
 
                     console.log(`Chat completions call completed successfully.`);
 
-                    // Return the successful response object
-                    return {
-                        response: geminiResponse,
-                        selectedKeyId: selectedKey.id,
-                        modelCategory: modelCategory
-                    };
+                    // For KEEPALIVE mode with streaming client request
+                    if (useKeepAlive) {
+                        // Get the complete non-streaming response
+                        const geminiResponseData = await geminiResponse.json();
+
+                        // Return the complete response data, let apiV1.js handle keepalive and response sending
+                        return {
+                            response: geminiResponseData, // Directly return the parsed JSON data
+                            selectedKeyId: selectedKey.id,
+                            modelCategory: modelCategory,
+                            isKeepAlive: true, // Mark this as a keepalive mode response
+                            requestedModelId: requestedModelId // Pass modelId for subsequent use
+                        };
+                    } else {
+                        // Regular handling (non-KEEPALIVE)
+                        return {
+                            response: geminiResponse,
+                            selectedKeyId: selectedKey.id,
+                            modelCategory: modelCategory
+                        };
+                    }
                 }
 
             } catch (fetchError) {
@@ -244,7 +234,7 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
         console.error("Error before starting proxy attempts:", initialError);
         return {
             error: {
-                message: `Internal Proxy Error: ${error.message}`,
+                message: `Internal Proxy Error: ${initialError.message}`,
                 type: 'proxy_internal_error'
             },
             status: 500
