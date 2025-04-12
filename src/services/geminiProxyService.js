@@ -120,7 +120,7 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
                     // Add a prompt at the end of the request to encourage the model to use search tools
                     geminiRequestBody.contents.push({
                         role: 'user',
-                        parts: [{ text: 'Use search tools to retrieve content' }]
+                        parts: [{ text: '(Use search tools to get the relevant information and complete this request.)' }]
                     });
                 }
 
@@ -190,8 +190,12 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
 
                     // Handle specific errors impacting key status
                     if (geminiResponse.status === 429) {
-                        // Record 429 for the key
-                        geminiKeyService.handle429Error(selectedKey.id, modelCategory, requestedModelId)
+                        // Pass the error message to the handle429Error function
+                        const errorMessage = lastError?.message || errorBodyText;
+                        console.log(`429 error message: ${errorMessage}`);
+                        
+                        // Record 429 for the key - use actualModelId for consistent counting
+                        geminiKeyService.handle429Error(selectedKey.id, modelCategory, actualModelId, errorMessage)
                             .catch(err => console.error(`Error handling 429 for key ${selectedKey.id} in background:`, err));
 
                         // If not the last attempt, continue to the next key
@@ -216,8 +220,8 @@ async function proxyChatCompletions(openAIRequestBody, workerApiKey, stream) {
                 } else {
                     // 6. Process Successful Response
                     console.log(`Attempt ${attempt}: Request successful with key ${selectedKey.id}.`);
-                    // Increment usage count (assume this updates DB but doesn't sync every time, or its internal sync is secondary)
-                    geminiKeyService.incrementKeyUsage(selectedKey.id, requestedModelId, modelCategory)
+                    // Increment usage count for the actual model ID, not the -search version
+                    geminiKeyService.incrementKeyUsage(selectedKey.id, actualModelId, modelCategory)
                           .catch(err => console.error(`Error incrementing usage for key ${selectedKey.id} in background:`, err));
 
                     console.log(`Chat completions call completed successfully.`);
